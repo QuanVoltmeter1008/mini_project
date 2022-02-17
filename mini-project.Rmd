@@ -1,0 +1,322 @@
+---
+title: "mini-project"
+author: "Wei Quan"
+date: "12/20/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+knitr::opts_knit$set(root.dir = getwd())
+library(tidyverse)
+library(tableone)
+library(survival)
+library(survminer)
+
+# load data and preprocessing----------
+peermentor <- read.csv('peermentor.csv')
+
+## changing variables type to factor variables
+peermentor$gender <- factor(peermentor$gender)
+peermentor$gender <- relevel(peermentor$gender,ref='male')
+peermentor$region <- factor(peermentor$region)
+peermentor$residence <- factor(peermentor$residence)
+
+peermentor$injecting_history <- peermentor$injecting_status
+peermentor$injecting_history <- ifelse(peermentor$injecting_history=='Never injected','No History',peermentor$injecting_history)
+peermentor$injecting_history <- ifelse(peermentor$injecting_history=='Previously injected'|peermentor$injecting_history =='Currently injecting','With History',peermentor$injecting_history)
+
+peermentor$injecting_status <- factor(peermentor$injecting_status)
+peermentor$injecting_history <- factor(peermentor$injecting_history)
+
+peermentor$housing_status <- factor(peermentor$housing_status)
+peermentor$referral_source  <- factor(peermentor$referral_source)
+
+peermentor$rehab_success  <- factor(peermentor$rehab_success)
+peermentor$rehab_success_bi <- as.integer(peermentor$rehab_success)-1
+
+## relapse_bi is the binary outcome for relapse
+peermentor$relapse_bi <- ifelse(is.na(peermentor$relapse_days),0,1)
+
+peermentor$outcome <- peermentor$last_obs_outcome
+peermentor$outcome[peermentor$last_obs_outcome=='LTFU' & peermentor$relapse_bi ==1 & peermentor$last_study_obs >=360] <- 'Partially Completed'
+
+peermentor$last_obs_outcome  <- factor(peermentor$last_obs_outcome)
+peermentor$outcome  <- factor(peermentor$outcome)
+
+peermentor$intervention  <- factor(peermentor$intervention)
+peermentor$intervention  <- relevel(peermentor$intervention, ref='standard of care')
+
+peermentor$last_obs_0 <- ifelse(peermentor$last_study_obs==0,'Yes','No')
+
+## time is the event time for survival analysis
+peermentor <- peermentor %>% mutate(
+  time = as.numeric(ifelse(relapse_bi==0,last_study_obs,relapse_days)))
+
+## relapse_days_stvt, relapse_bi_stvt, and time_stvt are for sensitivity analysis 
+peermentor <- peermentor %>% 
+  mutate(relapse_days_stvt = ifelse(last_obs_outcome=='LTFU' & is.na(relapse_days),last_study_obs,relapse_days),
+         relapse_bi_stvt = ifelse(last_obs_outcome=='LTFU' & is.na(relapse_days),1,relapse_bi),
+         time_stvt = as.numeric(ifelse(relapse_bi_stvt==0,last_study_obs,relapse_days_stvt)))
+
+# check missing
+library(DataExplorer)
+plot_missing(peermentor)
+```
+
+## Summary
+
+```{r tabel1}
+CreateTableOne(peermentor,vars = c("gender","age","residence",
+                                   "duration_use",'region','residence',"housing_status",
+                                   "injecting_status","rehab_success",
+                                   "wellbeing1yr",
+                                   "relapse_days",'relapse_bi',
+                                   'outcome'),
+               strata = 'intervention',
+               factorVars = c("gender",'region',"residence",
+                              "housing_status",
+                              "injecting_status",'relapse_bi','outcome'))
+
+CreateTableOne(peermentor,vars = c("housing_status"),
+               strata = 'intervention',
+               factorVars = c("housing_status"))
+
+CreateTableOne(data=peermentor,vars = c("gender","age","residence",
+                                   "duration_use",'region','residence',"housing_status",
+                                   "injecting_status","rehab_success",
+                                   "wellbeing1yr",
+                                   "relapse_days",'relapse_bi',
+                                   'outcome'),factorVars = c("gender",'region',"residence",
+                              "housing_status",
+                              "injecting_status",'relapse_bi','outcome'))
+
+summary(peermentor)
+
+peermentor %>% group_by(intervention) %>% summarise_at(vars(age,duration_use),funs(median,quantile))
+
+# LTFU analysis
+CreateTableOne(peermentor,vars = c("gender","age","residence",
+                                   "duration_use",
+                                   "housing_status",
+                                   "injecting_status","rehab_success",
+                                   "wellbeing1yr","relapse_days",
+                                   "last_study_obs","intervention"),
+               strata = 'last_obs_outcome',
+               factorVars = c("gender","residence","housing_status",
+                              "injecting_status","intervention"))
+
+table(peermentor$last_obs_outcome,peermentor$intervention)
+
+# number of patients LTFU at the beginning
+table(peermentor$last_obs_0,peermentor$intervention)
+
+# number of patients LTFU withinin one year
+peermentor %>% group_by(intervention,last_obs_outcome) %>%
+  summarise(sum(is.na(wellbeing1yr)))
+
+aggregate(wellbeing1yr~intervention+last_obs_outcome, peermentor,mean)
+
+peermentor %>% group_by(intervention,last_obs_outcome,is.na(wellbeing1yr)) %>% summarise(n(),max(last_study_obs))
+
+par(mfrow = c(1,2))
+hist(peermentor$last_study_obs[peermentor$last_obs_outcome=='LTFU'],main = 'Time to censoring')
+hist(peermentor$relapse_days[peermentor$last_obs_outcome=='Study completed'],main = 'Time to relapse')
+
+par(mfrow = c(1,1))
+```
+
+## Q1
+
+```{r}
+df1 <- peermentor[peermentor$injecting_history!='Missing',]
+df1$injecting_history <- factor(df1$injecting_history)
+df1$injecting_status <- factor(df1$injecting_status)
+
+# H0: There is no difference in duration of opiate use before entering therapy between treatment programme success group and not success group
+mean(peermentor$duration_use)
+peermentor$duration_use_mean <- peermentor$duration_use -mean(peermentor$duration_use)
+
+fit1 <- glm(data=peermentor,rehab_success ~ duration_use_mean , family='binomial')
+summary(fit1)
+
+exp(coef(fit1))
+exp(confint(fit1))
+odds_6 = exp(0.238411+6*(-0.010899)) 
+risk_6 = odds_6/(1+odds_6)
+risk_6
+
+odds_24 = exp(0.238411+24*(-0.010899)) 
+risk_24 = odds_24/(1+odds_24)
+risk_24
+
+fit1_adjusted <- glm(data=peermentor,rehab_success ~ duration_use_mean +age+gender+residence+housing_status, family='binomial')
+summary(fit1_adjusted)
+
+exp(coef(fit1_adjusted))
+exp(confint(fit1_adjusted))
+
+anova(fit1,fit1_adjusted,test='LRT')
+
+# H0: The proportion of treatment programme success are the same for those who had injecting history and those who had not. 
+
+tab <- table(df1$injecting_history, df1$rehab_success)
+tab_out <- rbind(tab, Total = colSums(tab))
+
+x <- tab_out[ , "Yes"]
+n <- rowSums(tab_out)
+prop <- x / n
+odds <- prop / (1 - prop)
+tab_out <- cbind(tab_out, Total = n, Proportion_success = prop, Odds = odds)
+tab_out
+
+# risk and CI
+prop.test(tab_out[1,2],tab_out[1,3])
+prop.test(tab_out[2,2],tab_out[2,3])
+
+rd <- prop[1] - prop[2]
+rr <- prop[1] / prop[2]
+rd_se <- sqrt(sum(prop[1:2] * (1 - prop[1:2]) / n[1:2]))
+rd_ci <- rd + c(-1, 1) * qnorm(0.975) * rd_se
+
+## RD SE based on null hypothesis that RD = 0 --> use pooled proportion
+rd_se0 <- sqrt(prop[3] * (1 - prop[3]) * sum(1/n[1:2]))
+rd_z <- rd / rd_se0
+rd_pval <- 2 * pnorm(-abs(rd_z))
+rd_pval
+prop.test(x[1:2], n[1:2])
+
+## Log risk ratio inference
+log_rr <- log(rr)
+log_rr_se <- sqrt(sum(1/x[1:2]) - sum(1/n[1:2]))
+log_rr_ci <- log_rr + c(-1, 1) * qnorm(0.975) * log_rr_se
+rr_ci <- exp(log_rr_ci)
+log_rr_z <- log_rr / log_rr_se
+log_rr_pval <- 2 * pnorm(-abs(log_rr_z))
+log_rr_pval
+
+summary <- data.frame(
+  value = c(rd,rr),
+  CIl = c(rd_ci[1],rr_ci[1]),
+  CIh = c(rd_ci[2],rr_ci[2]),
+  SE = c(rd_se,log_rr_se),
+  Z = c(rd_z,log_rr_z),
+  pvalue = c(rd_pval,log_rr_pval),
+  row.names=c('Risk Difference','Risk Ratio')
+) %>% knitr::kable(digits=3)
+
+summary
+```
+
+## Q2
+
+```{r,fig.width=6,fig.height=6}
+df2 <- peermentor %>% filter(last_study_obs >0)
+
+# log-rank
+survdiff(Surv(time,relapse_bi)~intervention,data=df2)
+
+# overall survival
+survfit(Surv(time,relapse_bi)~1,data=df2)
+
+fitKM <- survfit(Surv(time,relapse_bi)~intervention,data=df2)
+fitKM
+
+summary(fitKM, time=c(360))
+
+p1 <- ggsurvplot(fitKM,
+           risk.table = TRUE,
+           fontsize = 3,
+           fun = 'pct',
+           xlab = "Time(Days)",
+           legend.labs = c('PMP','SoC'),
+           break.x.by = 120,
+           xlim = c(0,720),
+           size = 0.5,
+           palette = c('brown','blue4'),
+           surv.plot.height =1,
+           ylab = 'Relapse-free Survival After Discharge(%)',
+           font.x = 'bold',
+           font.y = 'bold',
+           ggtheme = theme_bw())
+
+print(p1,risk.table.height = 0.2)
+
+#-loglog plot
+plot(fitKM,col=2:3,fun='cloglog')
+```
+
+```{r,fig.width=8,fig.height=8}
+# cox model
+df2$intervention  <- relevel(df2$intervention, ref='standard of care')
+df2_inj <- df2 %>% filter(injecting_history!='Missing')
+df2_inj$injecting_history <- factor(df2_inj$injecting_history)
+df2_inj$intervention  <- relevel(df2_inj$intervention, ref='peer mentoring')
+
+# crude HR
+cox_model <- coxph(Surv(time,relapse_bi) ~ intervention, data=df2)
+summary(cox_model)
+
+cox_model_multi2 <- coxph(Surv(time,relapse_bi) ~ intervention+gender+age+residence+housing_status+injecting_history+duration_use+rehab_success, data=df2)
+summary(cox_model_multi2)  
+
+# subgroup history
+fitKM_inj <- survfit(Surv(time,relapse_bi) ~ injecting_history,data=df2_inj)
+fitKM_inj
+cox_model_inj <- coxph(Surv(time,relapse_bi) ~ intervention:strata(injecting_history), data=df2_inj)
+summary(cox_model_inj)
+coxph(Surv(time,relapse_bi) ~ intervention*injecting_history, data=df2_inj)
+
+# subgroup gender
+df2$intervention  <- relevel(df2$intervention, ref='peer mentoring')
+fitKM_gen <- survfit(Surv(time,relapse_bi) ~ gender,data=df2)
+fitKM_gen
+cox_model_gen <- coxph(Surv(time,relapse_bi) ~ intervention:strata(gender), data=df2)
+summary(cox_model_gen)
+coxph(Surv(time,relapse_bi) ~ intervention*gender, data=df2)
+
+# residual plot
+cox.zph(cox_model_multi2)
+ggcoxzph(cox.zph(cox_model_multi2))
+
+# time-splitting
+peermentor_split <- survSplit(Surv(time,relapse_bi)~ .,df2, cut = c(120), episode = "period")
+
+peermentor_split$period <- factor(peermentor_split$period,c(1,2),c('<4mos','>4mos'))
+peermentor_split$intervention <- relevel(peermentor_split$intervention, ref='peer mentoring')
+
+fitKM_split <- survfit(Surv(tstart,time,relapse_bi) ~ period,data=peermentor_split)
+fitKM_split
+cox_model_split <- coxph(Surv(tstart,time,relapse_bi)~intervention:strata(period),data=peermentor_split)
+summary(cox_model_split)
+coxph(Surv(tstart,time,relapse_bi)~intervention*strata(period),data=peermentor_split)
+
+# sensitivity analysis
+df2$intervention  <- relevel(df2$intervention, ref='standard of care')
+cox_model_stvt <- coxph(Surv(time_stvt,relapse_bi_stvt) ~ intervention, data=df2)
+summary(cox_model_stvt)
+survdiff(Surv(time_stvt,relapse_bi_stvt)~intervention,data=df2)
+```
+
+## Q3
+
+```{r}
+df3 <- peermentor %>% filter(!is.na(peermentor$wellbeing1yr))
+df3_pmp_group <- df3 %>%filter(intervention=='peer mentoring')
+df3_soc_group <- df3 %>%filter(intervention=='standard of care')
+t.test(df3_pmp_group$wellbeing1yr,df3_soc_group$wellbeing1yr)
+
+df3$intervention_bi <- ifelse(df3$intervention=='peer mentoring',1,0) 
+
+ggplot(df3,aes(intervention_bi,wellbeing1yr))+
+  geom_point(color='lightblue')+
+  geom_smooth(method='lm',se=FALSE,color='royalblue')+
+  theme_classic()
+
+fit3 <- lm(data=df3,wellbeing1yr~intervention)
+summary(fit3)
+
+fit3_adjusted <- lm(data=df3,wellbeing1yr~intervention+gender+age+residence+housing_status+injecting_history+duration_use+rehab_success)
+summary(fit3_adjusted)
+```
